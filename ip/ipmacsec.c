@@ -31,6 +31,12 @@ static const char * const validate_str[] = {
 	[MACSEC_VALIDATE_STRICT] = "strict",
 };
 
+static const char * const offload_str[] = {
+	[MACSEC_OFFLOAD_OFF] = "off",
+	[MACSEC_OFFLOAD_PHY] = "phy",
+	[MACSEC_OFFLOAD_MAC] = "mac",
+};
+
 struct sci {
 	__u64 sci;
 	__u16 port;
@@ -93,6 +99,7 @@ static void ipmacsec_usage(void)
 		"       ip macsec del DEV rx SCI sa { 0..3 }\n"
 		"       ip macsec show\n"
 		"       ip macsec show DEV\n"
+		"       ip macsec offload DEV [ off | mac | phy ]\n"
 		"where  OPTS := [ pn <u32> ] [ on | off ]\n"
 		"       ID   := 128-bit hex string\n"
 		"       KEY  := 128-bit or 256-bit hex string\n"
@@ -354,6 +361,7 @@ enum cmd {
 	CMD_ADD,
 	CMD_DEL,
 	CMD_UPD,
+	CMD_OFFLOAD,
 	__CMD_MAX
 };
 
@@ -369,6 +377,9 @@ static const enum macsec_nl_commands macsec_commands[__CMD_MAX][2][2] = {
 	[CMD_DEL] = {
 		[0] = {-1, MACSEC_CMD_DEL_RXSC},
 		[1] = {MACSEC_CMD_DEL_TXSA, MACSEC_CMD_DEL_RXSA},
+	},
+	[CMD_OFFLOAD] = {
+		[0] = {-1, MACSEC_CMD_UPD_OFFLOAD },
 	},
 };
 
@@ -529,6 +540,44 @@ static int do_modify(enum cmd c, int argc, char **argv)
 	return -1;
 }
 
+static int do_offload(enum cmd c, int argc, char **argv)
+{
+	enum macsec_offload offload;
+	struct rtattr *attr;
+	int ifindex, ret;
+
+	if (argc == 0)
+		ipmacsec_usage();
+
+	ifindex = ll_name_to_index(*argv);
+	if (!ifindex) {
+		fprintf(stderr, "Device \"%s\" does not exist.\n", *argv);
+		return -1;
+	}
+	argc--; argv++;
+
+	if (argc == 0)
+		ipmacsec_usage();
+
+	ret = one_of("offload", *argv, offload_str, ARRAY_SIZE(offload_str),
+		     (int *)&offload);
+	if (ret)
+		ipmacsec_usage();
+
+	MACSEC_GENL_REQ(req, MACSEC_BUFLEN, macsec_commands[c][0][1], NLM_F_REQUEST);
+
+	addattr32(&req.n, MACSEC_BUFLEN, MACSEC_ATTR_IFINDEX, ifindex);
+
+	attr = addattr_nest(&req.n, MACSEC_BUFLEN, MACSEC_ATTR_OFFLOAD);
+	addattr8(&req.n, MACSEC_BUFLEN, MACSEC_OFFLOAD_ATTR_TYPE, offload);
+	addattr_nest_end(&req.n, attr);
+
+	if (rtnl_talk(&genl_rth, &req.n, NULL) < 0)
+		return -2;
+
+	return 0;
+}
+
 /* dump/show */
 static struct {
 	int ifindex;
@@ -539,7 +588,8 @@ static int validate_dump(struct rtattr **attrs)
 {
 	return attrs[MACSEC_ATTR_IFINDEX] && attrs[MACSEC_ATTR_SECY] &&
 	       attrs[MACSEC_ATTR_TXSA_LIST] && attrs[MACSEC_ATTR_RXSC_LIST] &&
-	       attrs[MACSEC_ATTR_TXSC_STATS] && attrs[MACSEC_ATTR_SECY_STATS];
+	       attrs[MACSEC_ATTR_TXSC_STATS] && attrs[MACSEC_ATTR_SECY_STATS] &&
+	       attrs[MACSEC_ATTR_OFFLOAD];
 
 }
 
@@ -939,13 +989,14 @@ static void print_rxsc_list(struct rtattr *sc)
 
 static int process(struct nlmsghdr *n, void *arg)
 {
-	struct genlmsghdr *ghdr;
-	struct rtattr *attrs[MACSEC_ATTR_MAX + 1];
+	struct rtattr *attrs_offload[MACSEC_OFFLOAD_ATTR_MAX + 1];
 	struct rtattr *attrs_secy[MACSEC_SECY_ATTR_MAX + 1];
+	struct rtattr *attrs[MACSEC_ATTR_MAX + 1];
+	__u8 encoding_sa, offload;
+	struct genlmsghdr *ghdr;
 	int len = n->nlmsg_len;
 	int ifindex;
 	__u64 sci;
-	__u8 encoding_sa;
 
 	if (n->nlmsg_type != genl_family)
 		return -1;
@@ -967,6 +1018,8 @@ static int process(struct nlmsghdr *n, void *arg)
 	ifindex = rta_getattr_u32(attrs[MACSEC_ATTR_IFINDEX]);
 	parse_rtattr_nested(attrs_secy, MACSEC_SECY_ATTR_MAX,
 			    attrs[MACSEC_ATTR_SECY]);
+	parse_rtattr_nested(attrs_offload, MACSEC_OFFLOAD_ATTR_MAX,
+			    attrs[MACSEC_ATTR_OFFLOAD]);
 
 	if (!validate_secy_dump(attrs_secy)) {
 		fprintf(stderr, "incomplete dump message\n");
@@ -996,6 +1049,11 @@ static int process(struct nlmsghdr *n, void *arg)
 
 	if (attrs[MACSEC_ATTR_RXSC_LIST])
 		print_rxsc_list(attrs[MACSEC_ATTR_RXSC_LIST]);
+
+	offload = rta_getattr_u8(attrs_offload[MACSEC_OFFLOAD_ATTR_TYPE]);
+	print_string(PRINT_ANY, "offload",
+		     "    offload %s ", offload_str[offload]);
+	print_nl();
 
 	close_json_object();
 
@@ -1068,6 +1126,8 @@ int do_ipmacsec(int argc, char **argv)
 		return do_modify(CMD_UPD, argc-1, argv+1);
 	if (matches(*argv, "delete") == 0)
 		return do_modify(CMD_DEL, argc-1, argv+1);
+	if (matches(*argv, "offload") == 0)
+		return do_offload(CMD_OFFLOAD, argc-1, argv+1);
 
 	fprintf(stderr, "Command \"%s\" is unknown, try \"ip macsec help\".\n",
 		*argv);
